@@ -1,5 +1,4 @@
 import { PassThrough } from "node:stream";
-import { setTimeout as delay } from "node:timers/promises";
 import { Sandbox } from "@vercel/sandbox";
 import {
   assertWorkspaceId,
@@ -100,7 +99,6 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       detached: true,
     });
     const observation = new AbortController();
-    const session = sandbox.currentSession();
     let canceled = command.signal?.aborted ?? false;
     const cancel = () => {
       canceled = true;
@@ -116,15 +114,18 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       }
     })();
     const completion = (async () => {
-      // A blocking SDK wait keeps its HTTP response open for the entire command.
-      // Poll the original session instead: transport timeouts must not relaunch agents.
+      // Metadata reads do not reliably include an exit status. Bound each wait
+      // on this original command so no HTTP request lasts for the whole agent run.
       while (true) {
-        const status = await session.getCommand(running.cmdId, {
-          signal: AbortSignal.any([observation.signal, AbortSignal.timeout(30_000)]),
-        });
-        if (status.exitCode !== null)
-          return { exitCode: status.exitCode, durationMs: status.durationMs };
-        await delay(1_000, undefined, { signal: observation.signal });
+        const timeout = AbortSignal.timeout(30_000);
+        try {
+          return await running.wait({
+            signal: AbortSignal.any([observation.signal, timeout]),
+          });
+        } catch (error) {
+          if (timeout.aborted && !observation.signal.aborted) continue;
+          throw error;
+        }
       }
     })();
     let result: Awaited<typeof completion>;

@@ -24,6 +24,7 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
           { type: "item.completed", item: { type: "agent_message", text: "ready" } },
           { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
         ];
+  const wait = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
   const runCommand = vi.fn(async (params: { timeoutMs?: number; detached?: boolean }) => {
     // Reproduce the provider contract that rejected the real default engine request.
     if ((params.timeoutMs ?? 0) > 18_000_000) {
@@ -37,7 +38,7 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
         for (const event of events) yield { stream: "stdout", data: `${JSON.stringify(event)}\n` };
         if (exitCode) yield { stream: "stderr", data: "command terminated" };
       },
-      wait: async () => ({ exitCode, durationMs: 10 }),
+      wait,
     };
   });
   const getCommand = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
@@ -45,7 +46,7 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
     asUser: () => ({ runCommand }),
     currentSession: () => ({ getCommand }),
   });
-  return { runCommand, kill, getCommand };
+  return { runCommand, kill, wait };
 }
 
 function request(engine: "claude_code" | "codex") {
@@ -99,17 +100,14 @@ describe.each(["claude_code", "codex"] as const)("%s through the Vercel runtime"
   });
 
   it("keeps the original native session while its command outlives an HTTP wait", async () => {
-    const { runCommand, kill, getCommand } = provider(engine);
-    getCommand
-      .mockResolvedValueOnce({ exitCode: null })
-      .mockResolvedValue({ exitCode: 0, durationMs: 1_200_000 });
+    const { runCommand, kill, wait } = provider(engine);
+    wait.mockResolvedValue({ exitCode: 0, durationMs: 1_200_000 });
     await expect(createEngine().run(request(engine))).resolves.toMatchObject({
       nativeSessionId: "native-session",
       output: "ready",
       exitCode: 0,
     });
-    expect(getCommand).toHaveBeenCalledTimes(2);
-    expect(getCommand).toHaveBeenCalledWith("cmd_agent", { signal: expect.any(AbortSignal) });
+    expect(wait).toHaveBeenCalledExactlyOnceWith({ signal: expect.any(AbortSignal) });
     expect(runCommand).toHaveBeenCalledOnce();
     expect(kill).not.toHaveBeenCalled();
   });
