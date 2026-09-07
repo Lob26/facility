@@ -103,6 +103,11 @@ describe("Vercel persistent workspace runtime", () => {
     );
     expect(sandbox.runCommand).toHaveBeenCalledTimes(1);
     expect(sandbox.stop).not.toHaveBeenCalled();
+    const bootstrap = sandbox.runCommand.mock.calls[0]?.[0].args[1];
+    expect(bootstrap).toContain("chown -h root:root /workspace/.facility/docker");
+    expect(bootstrap).not.toMatch(/chown\s+-R/);
+    expect(bootstrap).toContain('cat "/proc/$docker_pid/comm"');
+    expect(bootstrap).not.toContain('kill "$docker_pid"');
   });
 
   const input = {

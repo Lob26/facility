@@ -72,6 +72,11 @@ The runtime provider implements create, wake, execute, expose, inspect, suspend,
 Docker workspace uses a named volume independent of its replaceable container. Vercel uses durable
 snapshot-backed state while renewing finite compute leases.
 
+When a Vercel workspace resumes, Docker startup distinguishes a live daemon from a stale PID file
+retained in the snapshot. It waits for a live daemon, or removes stale PID and socket files before
+starting one. A recycled PID is never signaled. Bootstrap preserves ownership inside Docker layers
+and volumes so container data survives the resume.
+
 ## Operations
 
 ### Send message
@@ -128,3 +133,8 @@ Facility does not automatically delete workspaces after merge, archive, error, o
 Operators must monitor active compute and retained storage, define backup and retention rules, and
 use deletion deliberately. Project budgets and cost views support that decision but do not turn
 unknown provider pricing into zero.
+
+Vercel resume removes stale Docker/containerd runtime files only when the recorded
+Docker daemon is absent. A retained preview PID is signaled only when its command
+line matches the gateway and both ports. Docker readiness failures identify the
+retained daemon log. Existing container-file ownership is preserved, not repaired.

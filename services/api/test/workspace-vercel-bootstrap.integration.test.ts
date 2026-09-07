@@ -20,10 +20,35 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function localProvider(brokenGateway: boolean) {
+async function localProvider(
+  brokenGateway: boolean,
+  dockerState: "ready" | "stale-pid" | "starting" = "ready",
+) {
   const root = await mkdtemp(join(tmpdir(), "facility-vercel-bootstrap-"));
   const bin = join(root, "bin");
   await mkdir(bin);
+  await mkdir(join(root, "run"));
+  // Own the colliding PID, so even a regression that signals it cannot touch
+  // an unrelated host process. /proc itself remains a deterministic fake.
+  const colliding = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  const dockerPid = colliding.pid;
+  if (!dockerPid) throw new Error("missing fixture process PID");
+  cleanups.push(async () => {
+    colliding.kill();
+  });
+  await mkdir(join(root, "proc", String(dockerPid)), { recursive: true });
+  if (dockerState !== "ready") {
+    await writeFile(join(root, "run/docker.pid"), String(dockerPid));
+    await writeFile(join(root, "run/docker.sock"), "existing socket");
+    await mkdir(join(root, "run/docker/containerd"), { recursive: true });
+    await writeFile(join(root, "run/docker/containerd/containerd.pid"), String(dockerPid));
+    await writeFile(
+      join(root, "proc", String(dockerPid), "comm"),
+      dockerState === "starting" ? "dockerd\n" : "unrelated\n",
+    );
+  }
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const server = createServer((_req, res) => res.end("preview app"));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -43,8 +68,16 @@ async function localProvider(brokenGateway: boolean) {
   const gatewayPort = reserved.port;
   await new Promise<void>((resolve) => reserve.close(() => resolve()));
   const scripts: Record<string, string> = {
-    docker: "exit 0",
-    chown: "exit 0",
+    docker:
+      dockerState === "ready"
+        ? "exit 0"
+        : dockerState === "stale-pid"
+          ? `test -f '${root}/docker-ready'`
+          : `if test -f '${root}/docker-waited'; then exit 0; fi; touch '${root}/docker-waited'; exit 1`,
+    dockerd: `test ! -d '${root}/run/docker/containerd' || exit 8\ntest ! -f '${root}/run/docker.pid' || { echo 'stale daemon PID' >&2; exit 1; }\necho started > '${root}/docker-started'\ntouch '${root}/docker-ready'`,
+    // Model the ownership boundary: recursively reassigning a persisted Docker
+    // tree would corrupt container UIDs, even when daemon startup succeeds.
+    chown: 'test "$1" != -R || { echo "recursive ownership reset" >&2; exit 1; }',
     chmod: "exit 0",
     // Model the provider's environment reset; the real SDK must inject env after this transition.
     sudo: 'test "$1" = -u; shift 3; exec /usr/bin/env -i PATH="$PATH" "$@"',
@@ -75,7 +108,11 @@ async function localProvider(brokenGateway: boolean) {
       sudo?: boolean;
     }) => {
       const args = (params.args ?? []).map((arg) =>
-        arg.replaceAll("/workspace", root).replaceAll("65535", String(gatewayPort)),
+        arg
+          .replaceAll("/workspace", root)
+          .replaceAll("/var/run", join(root, "run"))
+          .replaceAll("/proc/", `${root}/proc/`)
+          .replaceAll("65535", String(gatewayPort)),
       );
       return new Promise<{ exitCode: number; stderr: () => Promise<string> }>((resolve, reject) => {
         const child = spawn(params.cmd, args, {
@@ -107,7 +144,7 @@ async function localProvider(brokenGateway: boolean) {
     await options.onCreate?.(fixture);
     return fixture;
   });
-  return { fixture, gatewayPort, appPort: address.port };
+  return { fixture, gatewayPort, appPort: address.port, root, dockerPid, colliding };
 }
 
 it("starts the real authenticated gateway through the SDK user switch without exposing a bare app", async () => {
@@ -145,4 +182,102 @@ it("fails initialization and stops newly allocated compute when the background g
     message: expect.stringContaining("did not start"),
   });
   expect(fixture.stop).toHaveBeenCalledOnce();
+});
+
+it("starts Docker after a restored PID collides with an unrelated process, preserving the volume tree", async () => {
+  const { fixture, appPort, root, dockerPid, colliding } = await localProvider(false, "stale-pid");
+  await mkdir(join(root, ".facility/docker/volumes/database"), { recursive: true });
+  await writeFile(join(root, ".facility/docker/volumes/database/retained"), "seeded database");
+  await new VercelWorkspaceRuntime().create({
+    id: fixture.name,
+    image: "runner:test",
+    ports: [{ service: "web", port: appPort }],
+    environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "x".repeat(32) },
+  });
+  expect(await readFile(join(root, "docker-started"), "utf8")).toBe("started\n");
+  expect(await readFile(join(root, "proc", String(dockerPid), "comm"), "utf8")).toBe("unrelated\n");
+  expect(colliding.exitCode).toBeNull();
+  expect(colliding.signalCode).toBeNull();
+  expect(await readFile(join(root, ".facility/docker/volumes/database/retained"), "utf8")).toBe(
+    "seeded database",
+  );
+  expect(fixture.stop).not.toHaveBeenCalled();
+});
+
+it("waits for an existing Docker daemon without removing its PID or launching another", async () => {
+  const { fixture, appPort, root, dockerPid } = await localProvider(false, "starting");
+  await new VercelWorkspaceRuntime().create({
+    id: fixture.name,
+    image: "runner:test",
+    ports: [{ service: "web", port: appPort }],
+    environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "x".repeat(32) },
+  });
+  expect(await readFile(join(root, "run/docker.pid"), "utf8")).toBe(String(dockerPid));
+  expect(await readFile(join(root, "run/docker.sock"), "utf8")).toBe("existing socket");
+  expect(await readFile(join(root, "run/docker/containerd/containerd.pid"), "utf8")).toBe(
+    String(dockerPid),
+  );
+  await expect(readFile(join(root, "docker-started"), "utf8")).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  expect(fixture.stop).not.toHaveBeenCalled();
+});
+
+it.each([
+  "unrelated",
+  "different-port",
+  "malformed",
+])("preserves a process referenced by a %s preview PID file", async (kind) => {
+  const { fixture, appPort, root, gatewayPort, dockerPid, colliding } = await localProvider(false);
+  await mkdir(join(root, ".facility"));
+  await writeFile(
+    join(root, `.facility/preview-${gatewayPort}.pid`),
+    kind === "malformed" ? "-1" : String(dockerPid),
+  );
+  const args =
+    kind === "different-port"
+      ? [
+          "node",
+          "/usr/local/bin/facility-preview-gateway",
+          "--listen",
+          "1",
+          "--target",
+          String(appPort),
+          "",
+        ]
+      : ["node", "/workspace/native-agent.js", ""];
+  await writeFile(join(root, "proc", String(dockerPid), "cmdline"), args.join("\0"));
+  await new VercelWorkspaceRuntime().create({
+    id: fixture.name,
+    image: "runner:test",
+    ports: [{ service: "web", port: appPort }],
+    environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "x".repeat(32) },
+  });
+  expect(colliding.exitCode).toBeNull();
+  expect(colliding.signalCode).toBeNull();
+});
+
+it("replaces only the recorded gateway invocation for this port", async () => {
+  const { fixture, appPort, root, gatewayPort, dockerPid, colliding } = await localProvider(false);
+  await mkdir(join(root, ".facility"));
+  await writeFile(join(root, `.facility/preview-${gatewayPort}.pid`), String(dockerPid));
+  await writeFile(
+    join(root, "proc", String(dockerPid), "cmdline"),
+    [
+      "node",
+      "/usr/local/bin/facility-preview-gateway",
+      "--listen",
+      String(gatewayPort),
+      "--target",
+      String(appPort),
+      "",
+    ].join("\0"),
+  );
+  await new VercelWorkspaceRuntime().create({
+    id: fixture.name,
+    image: "runner:test",
+    ports: [{ service: "web", port: appPort }],
+    environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "x".repeat(32) },
+  });
+  expect(colliding.signalCode).toBe("SIGTERM");
 });

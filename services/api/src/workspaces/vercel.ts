@@ -289,16 +289,57 @@ function workspaceBootstrapCommand(input: CreateWorkspace) {
   return [
     "set -eu",
     "mkdir -p /workspace/.facility/home /workspace/.facility/claude /workspace/.facility/codex /workspace/.facility/docker",
-    "chown -R node:node /workspace",
-    "if ! docker info >/dev/null 2>&1; then rm -f /var/run/docker.sock; nohup dockerd --host=unix:///var/run/docker.sock --data-root=/workspace/.facility/docker --storage-driver=vfs >/workspace/.facility/dockerd.log 2>&1 & fi",
-    "attempt=0; until docker info >/dev/null 2>&1; do attempt=$((attempt + 1)); test $attempt -lt 120; sleep 1; done",
+    // Reassign only the directories we create. Docker layers and volume files
+    // retain the owners required by the containers stored in this workspace.
+    "chown -h node:node /workspace /workspace/.facility /workspace/.facility/home /workspace/.facility/claude /workspace/.facility/codex",
+    "chown -h root:root /workspace/.facility/docker",
+    `if ! docker info >/dev/null 2>&1; then
+  docker_running=0
+  if test -r /var/run/docker.pid; then
+    docker_pid="$(cat /var/run/docker.pid)"
+    case "$docker_pid" in
+      ''|*[!0-9]*) ;;
+      *) if test "$(cat "/proc/$docker_pid/comm" 2>/dev/null || true)" = dockerd; then docker_running=1; fi ;;
+    esac
+  fi
+  if test "$docker_running" = 0; then
+    # A restored disk can contain a PID now owned by an unrelated process.
+    # Remove only stale daemon artifacts; never signal that recycled PID.
+    rm -f /var/run/docker.pid /var/run/docker.sock
+    rm -rf /var/run/docker/containerd
+    nohup dockerd --host=unix:///var/run/docker.sock --data-root=/workspace/.facility/docker --storage-driver=vfs >/workspace/.facility/dockerd.log 2>&1 &
+  fi
+fi`,
+    `attempt=0
+until docker info >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if test "$attempt" -ge 120; then
+    echo "Docker did not become ready within 120 seconds; inspect /workspace/.facility/dockerd.log" >&2
+    exit 1
+  fi
+  sleep 1
+done`,
     "chown root:node /var/run/docker.sock",
     "chmod 0660 /var/run/docker.sock",
     ...gatewayPorts.map(({ port, gatewayPort }) => {
-      return `runuser --user node --preserve-environment -- sh -lc '
-set -eu
+      const gatewayCommand = `set -eu
 pid_file=/workspace/.facility/preview-${gatewayPort}.pid
-if test -f "$pid_file"; then kill "$(cat "$pid_file")" >/dev/null 2>&1 || true; fi
+# A retained PID is only a hint: verify the full gateway invocation before signaling it.
+node - "$pid_file" ${gatewayPort} ${port.port} <<'NODE'
+const fs = require("node:fs");
+try {
+  const pid = fs.readFileSync(process.argv[2], "utf8").trim();
+  if (!/^[1-9][0-9]*$/.test(pid)) process.exit(0);
+  const argv = fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").split("\\0");
+  if (argv.length === 7 && argv[1] === "/usr/local/bin/facility-preview-gateway" &&
+      argv[2] === "--listen" && argv[3] === process.argv[3] &&
+      argv[4] === "--target" && argv[5] === process.argv[4] && argv[6] === "") {
+    process.kill(Number(pid), "SIGTERM");
+  }
+} catch (error) {
+  if (!["ENOENT", "ESRCH"].includes(error.code)) throw error;
+}
+NODE
 nohup facility-preview-gateway --listen ${gatewayPort} --target ${port.port} >>/workspace/.facility/preview-${gatewayPort}.log 2>&1 &
 pid=$!
 echo "$pid" > "$pid_file"
@@ -313,7 +354,8 @@ until test "$(curl --silent --output /dev/null --write-out "%{http_code}" --max-
   sleep 0.1
 done
 kill -0 "$pid" 2>/dev/null || { echo "Preview gateway on port ${gatewayPort} exited during startup" >&2; exit 1; }
-'`;
+`;
+      return `runuser --user node --preserve-environment -- sh -lc ${shellQuote(gatewayCommand)}`;
     }),
   ].join("\n");
 }
@@ -322,4 +364,8 @@ function isVercelNotFound(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const value = error as { code?: unknown; status?: unknown; statusCode?: unknown };
   return value.code === "not_found" || value.status === 404 || value.statusCode === 404;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
