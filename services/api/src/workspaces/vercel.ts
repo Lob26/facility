@@ -98,33 +98,53 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
           : Math.min(command.timeoutMs, MAX_COMMAND_TIMEOUT_MS),
       detached: true,
     });
+    const observation = new AbortController();
     let canceled = command.signal?.aborted ?? false;
     const cancel = () => {
       canceled = true;
+      observation.abort();
       void running.kill("SIGTERM").catch(() => undefined);
     };
     command.signal?.addEventListener("abort", cancel, { once: true });
     if (canceled) cancel();
     const logs = (async () => {
-      for await (const log of running.logs()) {
+      for await (const log of running.logs({ signal: observation.signal })) {
         if (log.stream === "stdout") stdoutStream.write(log.data);
         else stderrStream.write(log.data);
       }
     })();
-    const result = await (async () => {
-      const finished = await running.wait();
-      await logs;
-      return finished;
-    })().finally(() => {
+    const completion = (async () => {
+      // Metadata reads do not reliably include an exit status. Bound each wait
+      // on this original command so no HTTP request lasts for the whole agent run.
+      while (true) {
+        const timeout = AbortSignal.timeout(30_000);
+        try {
+          return await running.wait({
+            signal: AbortSignal.any([observation.signal, timeout]),
+          });
+        } catch (error) {
+          if (timeout.aborted && !observation.signal.aborted) continue;
+          throw error;
+        }
+      }
+    })();
+    let result: Awaited<typeof completion>;
+    try {
+      [result] = await Promise.all([completion, logs]);
+      if (canceled) throw new Error("command canceled");
+    } catch (error) {
+      if (canceled) {
+        throw new WorkspaceRuntimeError(
+          "workspace_command_canceled",
+          "workspace command was canceled",
+        );
+      }
+      throw error;
+    } finally {
+      observation.abort();
       command.signal?.removeEventListener("abort", cancel);
       stdoutStream.end();
       stderrStream.end();
-    });
-    if (canceled) {
-      throw new WorkspaceRuntimeError(
-        "workspace_command_canceled",
-        "workspace command was canceled",
-      );
     }
     return {
       exitCode: result.exitCode,

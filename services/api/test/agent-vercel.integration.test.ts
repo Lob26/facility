@@ -24,23 +24,29 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
           { type: "item.completed", item: { type: "agent_message", text: "ready" } },
           { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
         ];
+  const wait = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
   const runCommand = vi.fn(async (params: { timeoutMs?: number; detached?: boolean }) => {
     // Reproduce the provider contract that rejected the real default engine request.
     if ((params.timeoutMs ?? 0) > 18_000_000) {
       throw new Error("Invalid request: `timeout` should be <= 18000000.");
     }
     return {
+      cmdId: "cmd_agent",
       kill,
       logs: async function* () {
         onLog?.();
         for (const event of events) yield { stream: "stdout", data: `${JSON.stringify(event)}\n` };
         if (exitCode) yield { stream: "stderr", data: "command terminated" };
       },
-      wait: async () => ({ exitCode, durationMs: 10 }),
+      wait,
     };
   });
-  sandboxApi.get.mockResolvedValue({ asUser: () => ({ runCommand }) });
-  return { runCommand, kill };
+  const getCommand = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
+  sandboxApi.get.mockResolvedValue({
+    asUser: () => ({ runCommand }),
+    currentSession: () => ({ getCommand }),
+  });
+  return { runCommand, kill, wait };
 }
 
 function request(engine: "claude_code" | "codex") {
@@ -90,6 +96,19 @@ describe.each(["claude_code", "codex"] as const)("%s through the Vercel runtime"
         args: expect.arrayContaining([engine === "codex" ? "codex" : "claude", "native-session"]),
       }),
     );
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original native session while its command outlives an HTTP wait", async () => {
+    const { runCommand, kill, wait } = provider(engine);
+    wait.mockResolvedValue({ exitCode: 0, durationMs: 1_200_000 });
+    await expect(createEngine().run(request(engine))).resolves.toMatchObject({
+      nativeSessionId: "native-session",
+      output: "ready",
+      exitCode: 0,
+    });
+    expect(wait).toHaveBeenCalledExactlyOnceWith({ signal: expect.any(AbortSignal) });
+    expect(runCommand).toHaveBeenCalledOnce();
     expect(kill).not.toHaveBeenCalled();
   });
 
