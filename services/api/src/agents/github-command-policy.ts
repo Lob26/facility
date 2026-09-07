@@ -1,4 +1,5 @@
 import type { GithubClientFactory } from "../github/client.js";
+import { githubRateLimitRetryAt } from "../github/rate-limit.js";
 
 type GithubObject = Record<string, unknown>;
 
@@ -71,6 +72,7 @@ export async function githubSenderCanStartAgent(input: {
     // GitHub reports maintain as "write" here; the distinct role is in role_name.
     return permission === "admin" || permission === "write";
   } catch (error) {
+    if (githubRateLimitRetryAt(error)) throw error;
     const status = object(error).status;
     if (status === 401 || status === 403 || status === 404) return false;
     // Retry transient provider failures; never interpret them as permission.
