@@ -168,4 +168,14 @@ describe("authoritative GitHub sender permission", () => {
     request.mockRejectedValue(failure);
     await expect(githubSenderCanStartAgent(input)).rejects.toBe(failure);
   });
+
+  it("keeps a throttled permission lookup retryable and rechecks current permission", async () => {
+    const { request, input } = fixture();
+    const failure = { status: 403, response: { headers: { "x-ratelimit-remaining": "0" } } };
+    request.mockRejectedValueOnce(failure);
+    await expect(githubSenderCanStartAgent(input)).rejects.toBe(failure);
+    await expect(githubSenderCanStartAgent(input)).resolves.toBe(true);
+    request.mockResolvedValueOnce({ data: { permission: "read" } });
+    await expect(githubSenderCanStartAgent(input)).resolves.toBe(false);
+  });
 });

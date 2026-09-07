@@ -89,6 +89,7 @@ describe("agent automations use persistent story workspaces", async () => {
   const installationNumber = 12_000_000 + Math.floor(Math.random() * 100_000);
   let permission = "write";
   let failPermissionFor: string | undefined;
+  let rateLimitFor: string | undefined;
   const permissionRequests: Array<Record<string, unknown> | undefined> = [];
   const githubFactory: GithubClientFactory = async (requestedInstallation) => {
     if (requestedInstallation !== installationNumber)
@@ -98,6 +99,18 @@ describe("agent automations use persistent story workspaces", async () => {
         if (route !== "GET /repos/{owner}/{repo}/collaborators/{username}/permission")
           throw new Error("unexpected GitHub route");
         permissionRequests.push(args);
+        if (args?.username === rateLimitFor) {
+          rateLimitFor = undefined;
+          throw {
+            status: 403,
+            response: {
+              headers: {
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": String(Math.floor(Date.now() / 1_000) + 3_600),
+              },
+            },
+          };
+        }
         if (args?.username === failPermissionFor) {
           failPermissionFor = undefined;
           throw Object.assign(new Error("provider failure with private headers"), { status: 503 });
@@ -493,6 +506,104 @@ describe("agent automations use persistent story workspaces", async () => {
       await client.unsafe(`DROP SCHEMA "${schema}" CASCADE`);
     }
   }, 25_000);
+
+  it.each([
+    "write",
+    "read",
+  ])("defers throttled receipts durably and rechecks %s permission after reset", async (afterReset) => {
+    const schema = `rate_${suffix.replaceAll("-", "")}_${afterReset}`;
+    const boss = new PgBoss({ connectionString: databaseUrl, schema });
+    boss.on("error", () => undefined);
+    const event = commandEvent("/builder", afterReset === "write" ? 550 : 551);
+    event.payload.sender.login = "throttled-contributor";
+    const before = await persistedCounts();
+    await db.insert(githubWebhookEvents).values({
+      id: event.id,
+      orgId,
+      projectId,
+      repositoryId,
+      installationId: installationRowId,
+      eventType: event.eventType,
+      payload: event.payload,
+      verified: true,
+    });
+    try {
+      await boss.start();
+      await boss.createQueue("github.webhook");
+      const initialJob = await boss.send("github.webhook", { inboundEventId: event.id });
+      if (!initialJob) throw new Error("expected initial delivery job");
+      rateLimitFor = event.payload.sender.login;
+      await registerGithubWebhookWorker(boss, (id) => github.handleInbound(id), {
+        info: () => undefined,
+      });
+      await vi.waitFor(
+        async () => {
+          expect((await boss.getJobById("github.webhook", initialJob))?.state).toBe("completed");
+        },
+        { timeout: 5_000, interval: 100 },
+      );
+      const deferred = await client.unsafe(
+        `SELECT id, data, start_after FROM "${schema}".job WHERE id <> $1 AND name = 'github.webhook'`,
+        [initialJob],
+      );
+      expect(deferred).toHaveLength(1);
+      expect(deferred[0]?.data).toEqual({ inboundEventId: event.id });
+      expect(new Date(deferred[0]?.start_after).getTime()).toBeGreaterThan(Date.now() + 3_500_000);
+      expect(await boss.fetch("github.webhook")).toEqual([]);
+      expect(await persistedCounts()).toEqual(before);
+      expect(
+        (
+          await db.select().from(githubWebhookEvents).where(eq(githubWebhookEvents.id, event.id))
+        )[0],
+      ).toMatchObject({ processedAt: null, error: "github_webhook_processing_failed" });
+      expect(
+        await db
+          .select()
+          .from(auditEvents)
+          .where(eq(auditEvents.id, `github-trigger-denied:${orgId}:${event.id}`)),
+      ).toHaveLength(0);
+
+      // Advance only this isolated queue's persisted deadline; external calls
+      // remain deterministic fakes, and no wall-clock hour elapses in CI.
+      permission = afterReset;
+      await client.unsafe(`UPDATE "${schema}".job SET start_after = now() WHERE id = $1`, [
+        deferred[0]?.id,
+      ]);
+      await vi.waitFor(
+        async () => {
+          expect((await boss.getJobById("github.webhook", deferred[0]?.id))?.state).toBe(
+            "completed",
+          );
+        },
+        { timeout: 5_000, interval: 100 },
+      );
+      const after = await persistedCounts();
+      expect(after.turns).toBe(before.turns + (afterReset === "write" ? 1 : 0));
+      if (afterReset === "read") expect(after).toEqual(before);
+      const denials = await db
+        .select()
+        .from(auditEvents)
+        .where(eq(auditEvents.id, `github-trigger-denied:${orgId}:${event.id}`));
+      expect(denials).toHaveLength(afterReset === "read" ? 1 : 0);
+      if (afterReset === "read")
+        expect(denials[0]?.payload).toEqual({
+          reason: "github_sender_not_authorized",
+          eventType: "issue_comment",
+        });
+      expect(
+        (
+          await db.select().from(githubWebhookEvents).where(eq(githubWebhookEvents.id, event.id))
+        )[0],
+      ).toMatchObject({ processedAt: expect.any(Date), error: null });
+      await github.handleInbound(event.id);
+      expect(await persistedCounts()).toEqual(after);
+    } finally {
+      permission = "write";
+      rateLimitFor = undefined;
+      await boss.stop({ graceful: true, timeout: 5_000 });
+      await client.unsafe(`DROP SCHEMA "${schema}" CASCADE`);
+    }
+  }, 15_000);
 
   it("maintains linked PR metadata on comments that match no agent", async () => {
     const agent = agents[0];

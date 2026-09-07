@@ -49,6 +49,11 @@ installation tokens with [Metadata read access](https://docs.github.com/en/rest/
 Provider outages retry the affected delivery independently without granting permission. Processing
 failures are recorded in the webhook event; authorization denials are recorded as
 `github.agent_trigger.denied` audit events without provider response bodies or credentials.
+If GitHub throttles a delivery, its receipt remains unprocessed and the worker durably defers it
+until the provider's reset or retry deadline (at least one minute, bounded to one day for invalid
+far-future values). Repository permission is
+checked again when processing resumes; a rate limit never grants access or becomes a permanent
+authorization denial. The worker logs the deferred job and its retry time.
 
 An optional `command` on an `issue_comment` trigger restricts activation to a new explicit command
 on an open issue. See [the agent manifest reference](agent-manifest.md) for command syntax and
@@ -66,6 +71,9 @@ run deliveries update the project mirror where applicable. CI state attaches to 
 request only when the event's head SHA is current. The worker reconciles every connected repository
 every ten minutes, and maintainers can request an immediate sync through MCP, API, or the Pipeline
 page.
+Reconciliation keeps current terminal CI results for unchanged closed or merged pull requests.
+Open pulls, changed heads, missing or pending results, and pulls updated after the last CI refresh
+still request fresh CI. Webhook signals continue to update matching heads, including closed pulls.
 
 The mirror is a local operating view, not a replacement for GitHub. Issue, branch, pull-request,
 review, and check records retain GitHub identity and current state. Check suites and workflow runs
