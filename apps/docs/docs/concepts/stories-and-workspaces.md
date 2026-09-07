@@ -36,6 +36,12 @@ PostgreSQL separately retains messages, turns, attention items, environment even
 snapshots, costs, audit records, and provider references. Losing either store can make a story
 incomplete, so production backup policy must cover both.
 
+If an agent renames its branch to follow repository conventions, Facility adopts the branch
+recorded in that workspace when the turn succeeds. The next turn continues on it, and matching
+GitHub pull requests can be associated with the story. The change appears in the story's evidence
+history. Facility preserves an existing pull-request association and refuses stale evidence,
+another story's branch, the repository default branch, or an incomplete Git capture.
+
 ## Conversation and turns
 
 Messages are persisted before dispatch. A story permits one queued or running turn; later messages

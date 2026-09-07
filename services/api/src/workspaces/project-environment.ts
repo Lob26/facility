@@ -12,6 +12,7 @@ import type {
   WorkspaceRepository,
 } from "../github/workspace-credentials.js";
 import { appendWorkspaceEvent } from "./events.js";
+import { isSafeGitBranch } from "./git-branch.js";
 import type {
   PreviewEndpoint,
   WorkspaceCommandResult,
@@ -583,24 +584,6 @@ export function projectEnvironmentVariableName(projectId: string, name: string) 
     throw new ProjectEnvironmentError("project_id_invalid", "project id is invalid");
   }
   return `FACILITY_PROJECT_${projectId.toUpperCase()}_${EnvironmentName.parse(name)}`;
-}
-
-function isSafeGitBranch(branch: string) {
-  const hasControlOrForbiddenCharacter = [...branch].some((character) => {
-    const code = character.charCodeAt(0);
-    return code <= 0x20 || code === 0x7f || "~^:?*[\\".includes(character);
-  });
-  return Boolean(
-    branch &&
-      branch.length <= 200 &&
-      !branch.startsWith("-") &&
-      !branch.startsWith("/") &&
-      !branch.endsWith("/") &&
-      !branch.endsWith(".") &&
-      !branch.includes("..") &&
-      !branch.includes("@{") &&
-      !hasControlOrForbiddenCharacter,
-  );
 }
 
 function assertRepositoryContract(manifest: ProjectManifest, repositories: WorkspaceRepository[]) {
