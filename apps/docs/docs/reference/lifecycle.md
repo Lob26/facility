@@ -94,6 +94,15 @@ or external GitHub effects that already occurred.
 Retry asks Facility to attempt recoverable work again. Dismiss closes an obsolete attention item.
 A waiting-agent item is normally resolved by a user reply.
 
+### Open preview
+
+Opens the service in the same persistent workspace used by the story's agents. Once prepared,
+preview access preserves the current Git branch, uncommitted files, native sessions, and local
+data. It does not fetch or switch Git, rerun setup, or reseed. A declared `environment.ready`
+command lets Facility reuse healthy services; otherwise it runs `environment.start` on each open.
+A sleeping workspace wakes with its retained files. First-time preparation still runs normally;
+use **Clean setup** to apply repository or setup changes that require preparation again.
+
 ### Clean setup
 
 Prepares the existing workspace with setup forced even when the checksum matches. It does not
