@@ -485,6 +485,7 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       calls.push(request);
       return {
         token: "full-installation-token",
+        gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       };
     });
@@ -496,6 +497,10 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       },
     ]);
     expect(issued.repositories).toHaveLength(2);
+    expect(issued.gitIdentity).toEqual({
+      name: "my-app[bot]",
+      email: "12345+my-app[bot]@users.noreply.github.com",
+    });
     const serializedCredentials = issued.environment.FACILITY_GITHUB_CREDENTIALS;
     if (!serializedCredentials) throw new Error("expected serialized GitHub credentials");
     expect(JSON.parse(serializedCredentials)).toEqual({
@@ -529,5 +534,12 @@ describe("agent catalog and full GitHub workspace credentials", async () => {
       env: { ...process.env, FACILITY_GITHUB_CREDENTIALS: credentials },
     });
     expect(denied).toMatchObject({ status: 0, stdout: "" });
+  });
+
+  it("does not issue workspace credentials when the App identity lookup fails", async () => {
+    const broker = new GithubWorkspaceCredentialBroker(db, async () => {
+      throw new Error("GitHub App bot identity could not be verified");
+    });
+    await expect(broker.issue(orgId, projectId)).rejects.toThrow("could not be verified");
   });
 });

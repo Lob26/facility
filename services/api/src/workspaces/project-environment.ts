@@ -230,14 +230,14 @@ export class ProjectEnvironmentService {
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.name", "Facility Agent"],
+        ["config", "user.name", preparedInput.credentials.gitIdentity.name],
         cwd,
         "git identity",
       );
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.email", "facility-agent@users.noreply.github.com"],
+        ["config", "user.email", preparedInput.credentials.gitIdentity.email],
         cwd,
         "git identity",
       );
