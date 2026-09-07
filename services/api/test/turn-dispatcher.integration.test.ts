@@ -229,6 +229,7 @@ environment:
       storiesService,
       new AgentCatalogService(db, catalogSource),
       new GithubWorkspaceCredentialBroker(db, async () => ({
+        gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
         token: "secret-installation-token",
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       })),

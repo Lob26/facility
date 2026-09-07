@@ -89,6 +89,7 @@ environment:
 `);
 
   const credentials: GithubWorkspaceCredentials = {
+    gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
     repositories: [
       { owner: "acme", name: "app", defaultBranch: "main", role: "primary" },
       { owner: "acme", name: "shared", defaultBranch: "main", role: "related" },
@@ -177,6 +178,17 @@ environment:
       cwd: "repos/acme/app",
     });
     expect(branch.stdout.trim()).toBe("facility/story-environment");
+    for (const cwd of ["repos/acme/app", "repos/acme/shared"]) {
+      const author = await runtime.exec(locator, {
+        command: "git",
+        args: ["var", "GIT_AUTHOR_IDENT"],
+        cwd,
+      });
+      expect(author.exitCode).toBe(0);
+      expect(author.stdout).toMatch(
+        /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+      );
+    }
     expect(
       await readFile(join(workspace.volumeRef, "repos/acme/app/.facility-test/seed"), "utf8"),
     ).toBe("seeded");
@@ -197,6 +209,12 @@ environment:
       await db.select().from(storyArtifacts).where(eq(storyArtifacts.storyId, storyId)),
     ).toHaveLength(2);
 
+    // Repair existing workspaces created with the old unassociated address too.
+    await runtime.exec(locator, {
+      command: "git",
+      args: ["config", "user.email", "facility-agent@users.noreply.github.com"],
+      cwd: "repos/acme/app",
+    });
     await runtime.replaceCompute(locator);
     await environment.prepare({
       orgId,
@@ -208,6 +226,14 @@ environment:
       previousSetupChecksum: first.setupChecksum,
       readinessTimeoutMs: 2_000,
     });
+    const resumedAuthor = await runtime.exec(locator, {
+      command: "git",
+      args: ["var", "GIT_AUTHOR_IDENT"],
+      cwd: "repos/acme/app",
+    });
+    expect(resumedAuthor.stdout).toMatch(
+      /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+    );
     expect(await readFile(join(workspace.volumeRef, "repos/acme/app/.setup-count"), "utf8")).toBe(
       "1",
     );
