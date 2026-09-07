@@ -1,4 +1,5 @@
 import { PassThrough } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import { Sandbox } from "@vercel/sandbox";
 import {
   assertWorkspaceId,
@@ -98,33 +99,51 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
           : Math.min(command.timeoutMs, MAX_COMMAND_TIMEOUT_MS),
       detached: true,
     });
+    const observation = new AbortController();
+    const session = sandbox.currentSession();
     let canceled = command.signal?.aborted ?? false;
     const cancel = () => {
       canceled = true;
+      observation.abort();
       void running.kill("SIGTERM").catch(() => undefined);
     };
     command.signal?.addEventListener("abort", cancel, { once: true });
     if (canceled) cancel();
     const logs = (async () => {
-      for await (const log of running.logs()) {
+      for await (const log of running.logs({ signal: observation.signal })) {
         if (log.stream === "stdout") stdoutStream.write(log.data);
         else stderrStream.write(log.data);
       }
     })();
-    const result = await (async () => {
-      const finished = await running.wait();
-      await logs;
-      return finished;
-    })().finally(() => {
+    const completion = (async () => {
+      // A blocking SDK wait keeps its HTTP response open for the entire command.
+      // Poll the original session instead: transport timeouts must not relaunch agents.
+      while (true) {
+        const status = await session.getCommand(running.cmdId, {
+          signal: AbortSignal.any([observation.signal, AbortSignal.timeout(30_000)]),
+        });
+        if (status.exitCode !== null)
+          return { exitCode: status.exitCode, durationMs: status.durationMs };
+        await delay(1_000, undefined, { signal: observation.signal });
+      }
+    })();
+    let result: Awaited<typeof completion>;
+    try {
+      [result] = await Promise.all([completion, logs]);
+      if (canceled) throw new Error("command canceled");
+    } catch (error) {
+      if (canceled) {
+        throw new WorkspaceRuntimeError(
+          "workspace_command_canceled",
+          "workspace command was canceled",
+        );
+      }
+      throw error;
+    } finally {
+      observation.abort();
       command.signal?.removeEventListener("abort", cancel);
       stdoutStream.end();
       stderrStream.end();
-    });
-    if (canceled) {
-      throw new WorkspaceRuntimeError(
-        "workspace_command_canceled",
-        "workspace command was canceled",
-      );
     }
     return {
       exitCode: result.exitCode,

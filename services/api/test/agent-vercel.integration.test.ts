@@ -30,6 +30,7 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
       throw new Error("Invalid request: `timeout` should be <= 18000000.");
     }
     return {
+      cmdId: "cmd_agent",
       kill,
       logs: async function* () {
         onLog?.();
@@ -39,8 +40,12 @@ function provider(engine: "claude_code" | "codex", exitCode = 0, onLog?: () => v
       wait: async () => ({ exitCode, durationMs: 10 }),
     };
   });
-  sandboxApi.get.mockResolvedValue({ asUser: () => ({ runCommand }) });
-  return { runCommand, kill };
+  const getCommand = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
+  sandboxApi.get.mockResolvedValue({
+    asUser: () => ({ runCommand }),
+    currentSession: () => ({ getCommand }),
+  });
+  return { runCommand, kill, getCommand };
 }
 
 function request(engine: "claude_code" | "codex") {
@@ -90,6 +95,22 @@ describe.each(["claude_code", "codex"] as const)("%s through the Vercel runtime"
         args: expect.arrayContaining([engine === "codex" ? "codex" : "claude", "native-session"]),
       }),
     );
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original native session while its command outlives an HTTP wait", async () => {
+    const { runCommand, kill, getCommand } = provider(engine);
+    getCommand
+      .mockResolvedValueOnce({ exitCode: null })
+      .mockResolvedValue({ exitCode: 0, durationMs: 1_200_000 });
+    await expect(createEngine().run(request(engine))).resolves.toMatchObject({
+      nativeSessionId: "native-session",
+      output: "ready",
+      exitCode: 0,
+    });
+    expect(getCommand).toHaveBeenCalledTimes(2);
+    expect(getCommand).toHaveBeenCalledWith("cmd_agent", { signal: expect.any(AbortSignal) });
+    expect(runCommand).toHaveBeenCalledOnce();
     expect(kill).not.toHaveBeenCalled();
   });
 

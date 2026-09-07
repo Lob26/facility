@@ -77,6 +77,11 @@ retained in the snapshot. It waits for a live daemon, or removes stale PID and s
 starting one. A recycled PID is never signaled. Bootstrap preserves ownership inside Docker layers
 and volumes so container data survives the resume.
 
+Vercel agent commands start once and are tracked by short status requests to the same compute
+session while their output streams. Tracking does not hold one HTTP request open for the entire
+agent run, so a long command can finish within its configured provider timeout. Cancel still
+signals the existing command; a failed status or output read is reported without resubmitting it.
+
 ## Operations
 
 ### Send message

@@ -20,7 +20,10 @@ function fakeSandbox() {
     name: "ws_0123456789abcdef",
     status: "running",
     currentSnapshotId: "snap_persistent",
-    currentSession: () => ({ sessionId: "session_current" }),
+    currentSession: () => ({
+      sessionId: "session_current",
+      getCommand: vi.fn().mockResolvedValue({ exitCode: 0, durationMs: 12 }),
+    }),
     runCommand,
     asUser: vi.fn().mockReturnValue({ runCommand }),
     stop: vi.fn().mockResolvedValue(undefined),
@@ -152,6 +155,86 @@ describe("Vercel persistent workspace runtime", () => {
       [{ stream: "stdout", data: "ready" }],
       [{ stream: "stderr", data: "warning" }],
     ]);
+  });
+
+  it("observes one long-running command without opening a blocking wait or relaunching it", async () => {
+    const wait = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    const running = {
+      cmdId: "cmd_long",
+      wait,
+      logs: async function* () {
+        yield { stream: "stdout", data: "still working" };
+      },
+    };
+    const runCommand = vi.fn().mockResolvedValue(running);
+    const getCommand = vi
+      .fn()
+      .mockResolvedValueOnce({ exitCode: null })
+      .mockResolvedValue({ exitCode: 0, durationMs: 1_200_000 });
+    const sandbox = {
+      ...fakeSandbox(),
+      asUser: () => ({ runCommand }),
+      currentSession: () => ({ sessionId: "session_original", getCommand }),
+    };
+    sandboxApi.get.mockResolvedValue(sandbox);
+    const output = await new VercelWorkspaceRuntime().exec(input, {
+      command: "codex",
+      timeoutMs: 1_800_000,
+    });
+    expect(output).toMatchObject({ exitCode: 0, stdout: "still working", durationMs: 1_200_000 });
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(wait).not.toHaveBeenCalled();
+    expect(getCommand).toHaveBeenCalledTimes(2);
+    expect(getCommand).toHaveBeenCalledWith("cmd_long", { signal: expect.any(AbortSignal) });
+    expect(sandboxApi.get).toHaveBeenCalledOnce();
+    expect(sandbox.stop).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a denied status read without retrying command submission", async () => {
+    const denied = Object.assign(new Error("access revoked"), { status: 403 });
+    const runCommand = vi
+      .fn()
+      .mockResolvedValue({ cmdId: "cmd_denied", logs: async function* () {} });
+    const getCommand = vi.fn().mockRejectedValue(denied);
+    sandboxApi.get.mockResolvedValue({
+      ...fakeSandbox(),
+      asUser: () => ({ runCommand }),
+      currentSession: () => ({ getCommand }),
+    });
+    await expect(new VercelWorkspaceRuntime().exec(input, { command: "codex" })).rejects.toBe(
+      denied,
+    );
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(getCommand).toHaveBeenCalledOnce();
+  });
+
+  it("aborts pending status observation when the output stream fails", async () => {
+    const streamError = new Error("output stream disconnected");
+    const runCommand = vi.fn().mockResolvedValue({
+      cmdId: "cmd_stream",
+      logs: async function* () {
+        yield { stream: "stdout", data: "partial output" };
+        throw streamError;
+      },
+    });
+    const getCommand = vi.fn(
+      (_id: string, options: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(options.signal.reason), {
+            once: true,
+          });
+        }),
+    );
+    sandboxApi.get.mockResolvedValue({
+      ...fakeSandbox(),
+      asUser: () => ({ runCommand }),
+      currentSession: () => ({ getCommand }),
+    });
+    await expect(new VercelWorkspaceRuntime().exec(input, { command: "codex" })).rejects.toBe(
+      streamError,
+    );
+    expect(getCommand.mock.calls[0]?.[1].signal.aborted).toBe(true);
+    expect(runCommand).toHaveBeenCalledOnce();
   });
 
   it("uses the SDK's full HTTPS URL for exposed and inspected preview endpoints", async () => {
