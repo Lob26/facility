@@ -12,6 +12,7 @@ import type {
   WorkspaceRepository,
 } from "../github/workspace-credentials.js";
 import { appendWorkspaceEvent } from "./events.js";
+import { isSafeGitBranch } from "./git-branch.js";
 import type {
   PreviewEndpoint,
   WorkspaceCommandResult,
@@ -191,6 +192,11 @@ export class ProjectEnvironmentService {
       projectId,
       name,
     ) => process.env[projectEnvironmentVariableName(projectId, name)],
+    private readonly workspaceValues: (scope: {
+      orgId: string;
+      projectId: string;
+      workspaceId: string;
+    }) => Promise<Record<string, string>> = async () => ({}),
   ) {}
 
   async prepare(
@@ -201,7 +207,7 @@ export class ProjectEnvironmentService {
     },
   ) {
     assertRepositoryContract(input.manifest, input.credentials.repositories);
-    const preparedInput = this.withDeclaredEnvironment(input);
+    const preparedInput = await this.withDeclaredEnvironment(input);
     await this.run(preparedInput, "mkdir -p repos", ".", "environment.repositories");
     for (const repository of preparedInput.credentials.repositories) {
       await this.runCommand(
@@ -230,14 +236,14 @@ export class ProjectEnvironmentService {
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.name", "Facility Agent"],
+        ["config", "user.name", preparedInput.credentials.gitIdentity.name],
         cwd,
         "git identity",
       );
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.email", "facility-agent@users.noreply.github.com"],
+        ["config", "user.email", preparedInput.credentials.gitIdentity.email],
         cwd,
         "git identity",
       );
@@ -279,7 +285,7 @@ export class ProjectEnvironmentService {
   /** Reuse the agent's files and data; preview access must never prepare Git or reseed. */
   async startPrepared(input: EnvironmentInput & { setupChecksum: string }) {
     assertRepositoryContract(input.manifest, input.credentials.repositories);
-    const preparedInput = this.withDeclaredEnvironment(input);
+    const preparedInput = await this.withDeclaredEnvironment(input);
     const ready = preparedInput.manifest.environment.ready;
     const alreadyReady = ready
       ? (await this.command(preparedInput, ready, primaryPath(preparedInput.credentials)))
@@ -336,6 +342,7 @@ export class ProjectEnvironmentService {
       primaryCwd: primaryPath(preparedInput.credentials),
       setupChecksum,
       processEnvironment: preparedInput.credentials.environment,
+      secretNames: preparedInput.manifest.environment.secrets,
     };
   }
 
@@ -355,7 +362,7 @@ export class ProjectEnvironmentService {
         ".facility.yml does not define environment.browser_test",
       );
     }
-    const preparedInput = this.withDeclaredEnvironment({ ...input, branch: "browser-test" });
+    const preparedInput = await this.withDeclaredEnvironment({ ...input, branch: "browser-test" });
     const artifactDirectory = `.facility/artifacts/browser-${Date.now()}`;
     await this.runCommand(
       preparedInput,
@@ -418,19 +425,26 @@ export class ProjectEnvironmentService {
     return { result: safeResult, artifacts };
   }
 
-  private withDeclaredEnvironment<
+  private async withDeclaredEnvironment<
     T extends {
+      orgId: string;
       projectId: string;
+      workspace: WorkspaceLocator;
       manifest: ProjectManifest;
       credentials: GithubWorkspaceCredentials;
     },
-  >(input: T): T {
+  >(input: T): Promise<T> {
+    const managed = await this.workspaceValues({
+      orgId: input.orgId,
+      projectId: input.projectId,
+      workspaceId: input.workspace.id,
+    });
     const names = [...input.manifest.environment.variables, ...input.manifest.environment.secrets];
     const values: Record<string, string> = {};
     const missing: Array<{ name: string; operatorName: string }> = [];
     for (const name of names) {
       const operatorName = projectEnvironmentVariableName(input.projectId, name);
-      const value = this.environmentValue(input.projectId, name);
+      const value = managed[name] ?? this.environmentValue(input.projectId, name);
       if (value === undefined) missing.push({ name, operatorName });
       else values[name] = value;
     }
@@ -443,9 +457,16 @@ export class ProjectEnvironmentService {
     }
     return {
       ...input,
+      manifest: {
+        ...input.manifest,
+        environment: {
+          ...input.manifest.environment,
+          secrets: [...new Set([...input.manifest.environment.secrets, ...Object.keys(managed)])],
+        },
+      },
       credentials: {
         ...input.credentials,
-        environment: { ...input.credentials.environment, ...values },
+        environment: { ...input.credentials.environment, ...values, ...managed },
       },
     };
   }
@@ -585,24 +606,6 @@ export function projectEnvironmentVariableName(projectId: string, name: string) 
   return `FACILITY_PROJECT_${projectId.toUpperCase()}_${EnvironmentName.parse(name)}`;
 }
 
-function isSafeGitBranch(branch: string) {
-  const hasControlOrForbiddenCharacter = [...branch].some((character) => {
-    const code = character.charCodeAt(0);
-    return code <= 0x20 || code === 0x7f || "~^:?*[\\".includes(character);
-  });
-  return Boolean(
-    branch &&
-      branch.length <= 200 &&
-      !branch.startsWith("-") &&
-      !branch.startsWith("/") &&
-      !branch.endsWith("/") &&
-      !branch.endsWith(".") &&
-      !branch.includes("..") &&
-      !branch.includes("@{") &&
-      !hasControlOrForbiddenCharacter,
-  );
-}
-
 function assertRepositoryContract(manifest: ProjectManifest, repositories: WorkspaceRepository[]) {
   const configuredPrimary = repositories.find((repository) => repository.role === "primary");
   const configured = new Set(
@@ -682,8 +685,8 @@ function redactCredentials(
   const secrets = new Set<string>();
   for (const [name, candidate] of Object.entries(environment)) {
     if (
-      (sensitiveNames.includes(name) || name.includes("TOKEN") || name.includes("CREDENTIAL")) &&
-      candidate.length >= 4
+      (sensitiveNames.includes(name) && candidate.length > 0) ||
+      ((name.includes("TOKEN") || name.includes("CREDENTIAL")) && candidate.length >= 4)
     ) {
       secrets.add(candidate);
     }
