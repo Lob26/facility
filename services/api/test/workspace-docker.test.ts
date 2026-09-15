@@ -108,3 +108,74 @@ describe("Docker workspace readiness", () => {
     });
   });
 });
+
+/** Records the container definition `create` builds, without a Docker daemon. */
+function recordingDocker() {
+  const created: Array<Record<string, unknown>> = [];
+  const notFound = Object.assign(new Error("no such container"), { statusCode: 404 });
+  const container = {
+    id: "container-new",
+    start: async () => undefined,
+    remove: async () => undefined,
+    inspect: async () => ({
+      Id: "container-new",
+      State: { Running: true, StartedAt: "2026-09-15T10:00:00.000000000Z", ExitCode: 0 },
+      NetworkSettings: { Ports: {} },
+    }),
+    exec: async () => ({
+      start: async () => undefined,
+      inspect: async () => ({ Running: false, ExitCode: 0 }),
+    }),
+  };
+  const docker = {
+    getContainer: () => ({
+      ...container,
+      inspect: async () => {
+        throw notFound;
+      },
+    }),
+    getVolume: () => ({
+      inspect: async () => {
+        throw notFound;
+      },
+    }),
+    getNetwork: () => ({
+      inspect: async () => {
+        throw notFound;
+      },
+    }),
+    getImage: () => ({ inspect: async () => ({}) }),
+    createNetwork: async () => ({}),
+    createVolume: async () => ({}),
+    createContainer: async (options: Record<string, unknown>) => {
+      created.push(options);
+      return container;
+    },
+  } as unknown as Docker;
+  return { docker, created };
+}
+
+describe("Docker workspace bootstrap", () => {
+  it("clears the previous start's daemon runtime state before starting dockerd", async () => {
+    const { docker, created } = recordingDocker();
+
+    await new DockerWorkspaceRuntime(docker).create({
+      id: workspaceId,
+      image: "facility-runner:test",
+    });
+
+    const script = String((created[0]?.Cmd as string[])[0]);
+    const lines = script.split("\n");
+    const cleanup = lines.findIndex((line) => line.includes("/var/run/docker.pid"));
+    const daemon = lines.findIndex((line) => line.startsWith("dockerd "));
+
+    // A stopped container keeps its writable layer, so dockerd finds the pidfile
+    // its previous start wrote and refuses to boot. Removing it after the daemon
+    // line would be useless, which is why the order is asserted and not just the
+    // presence of the command.
+    expect(cleanup).toBeGreaterThanOrEqual(0);
+    expect(daemon).toBeGreaterThan(cleanup);
+    expect(lines[cleanup]).toContain("/var/run/docker");
+    expect(lines[cleanup]).toContain("/var/run/docker.sock");
+  });
+});

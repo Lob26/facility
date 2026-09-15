@@ -484,7 +484,15 @@ function workspaceBootstrapCommand(input: CreateWorkspace) {
     "rm -f /workspace/.facility/runtime-ready",
     "mkdir -p /workspace/.facility/home /workspace/.facility/claude /workspace/.facility/codex /workspace/.facility/docker",
     "chown -R node:node /workspace",
-    "rm -f /var/run/docker.sock",
+    // A stopped container keeps its writable layer, so the previous start's
+    // runtime state is still on disk when it is woken. dockerd refuses to boot
+    // while /var/run/docker.pid exists, and its exec root holds containerd's
+    // stale socket and pidfile too — the daemon would wait for a peer that
+    // stopped with the container. Nothing is running yet, because this script
+    // is the container's own entrypoint, so all of it is stale by construction.
+    // Compute replacement never hit this: it discards the layer. Suspend and
+    // wake reuse it, which is the path this clears.
+    "rm -rf /var/run/docker /var/run/docker.pid /var/run/docker.sock",
     "dockerd --host=unix:///var/run/docker.sock --data-root=/workspace/.facility/docker --storage-driver=vfs >/workspace/.facility/dockerd.log 2>&1 &",
     "attempt=0; until docker info >/dev/null 2>&1; do attempt=$((attempt + 1)); test $attempt -lt 120; sleep 1; done",
     "chown root:node /var/run/docker.sock",
