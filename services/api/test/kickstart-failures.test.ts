@@ -40,12 +40,31 @@ function githubError(status: number, message: string) {
 }
 
 /**
+ * GitHub answers 403 both when an installation may not do something and when it
+ * has spent its hourly budget. The two are told apart by the rate-limit headers,
+ * which is the shape `githubRateLimitRetryAt` reads.
+ */
+function throttledError(status: number, resetAt: number) {
+  return Object.assign(new Error("API rate limit exceeded"), {
+    status,
+    response: {
+      headers: {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(Math.floor(resetAt / 1_000)),
+      },
+    },
+  });
+}
+
+/**
  * `getContent` is the only call kickstart makes before it needs a base commit,
  * and `readRepoFiles` swallows its failures, so a repository is only observed to
  * be unusable when the base ref is resolved.
  */
 function fakeOctokit(options: {
   getBranch?: () => Promise<{ data: { commit: { sha: string } } }>;
+  createRef?: () => Promise<{ data: unknown }>;
+  updateRef?: () => Promise<{ data: unknown }>;
   contents?: Map<string, unknown>;
 }): Octokit {
   const contents = options.contents ?? new Map();
@@ -56,8 +75,8 @@ function fakeOctokit(options: {
         createBlob: async () => ({ data: { sha: "c".repeat(40) } }),
         createTree: async () => ({ data: { sha: "d".repeat(40) } }),
         createCommit: async () => ({ data: { sha: "e".repeat(40) } }),
-        createRef: async () => ({ data: {} }),
-        updateRef: async () => ({ data: {} }),
+        createRef: options.createRef ?? (async () => ({ data: {} })),
+        updateRef: options.updateRef ?? (async () => ({ data: {} })),
       },
       repos: {
         getContent: async (args: Record<string, unknown>) => {
@@ -160,6 +179,45 @@ describe("kickstart failures name the condition", () => {
     await expect(kickstartRepo(applyArgs(fakeDb(), throttled))).rejects.toMatchObject({
       statusCode: 429,
       code: "kickstart_github_rate_limited",
+    });
+  });
+
+  it("reads a 403 as throttling when the rate-limit headers say so, not as a permission fault", async () => {
+    // Telling an operator to check installation permissions while GitHub is
+    // only asking them to wait sends them to the wrong place entirely, and the
+    // repository's own helper already knows the difference.
+    // `x-ratelimit-reset` is whole seconds, so floor the fixture to one rather
+    // than asserting against a millisecond the header cannot carry.
+    const resetAt = Math.floor((Date.now() + 15 * 60 * 1_000) / 1_000) * 1_000;
+    const octokit = fakeOctokit({
+      getBranch: async () => {
+        throw throttledError(403, resetAt);
+      },
+    });
+
+    const failure = await kickstartRepo(applyArgs(fakeDb(), octokit)).catch((error) => error);
+    expect(failure).toMatchObject({ statusCode: 429, code: "kickstart_github_rate_limited" });
+    // The reset GitHub supplied is carried through, so the advice is a time.
+    expect(failure.message).toContain(new Date(resetAt + 1_000).toISOString());
+  });
+
+  it("calls a ref conflict a moving branch, not a repository without commits", async () => {
+    // GitHub answers 409 for an empty repository and for a ref that stopped
+    // being a fast-forward. Only the first is fixed by pushing a commit, so the
+    // two must not share a message. This one fails after the base resolved.
+    const octokit = fakeOctokit({
+      createRef: async () => {
+        throw githubError(422, "Reference already exists");
+      },
+      updateRef: async () => {
+        throw githubError(409, "Update is not a fast forward");
+      },
+    });
+
+    await expect(kickstartRepo(applyArgs(fakeDb(), octokit))).rejects.toMatchObject({
+      statusCode: 409,
+      code: "kickstart_branch_conflict",
+      message: expect.stringContaining("main"),
     });
   });
 
