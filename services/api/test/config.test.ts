@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseDotenv } from "dotenv";
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 import { readConfig } from "../src/config.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -78,6 +79,24 @@ describe("Facility 0.12 configuration", () => {
     expect(() =>
       readConfig({ ...template, SECRET_MASTER_KEY: validEnv.SECRET_MASTER_KEY }),
     ).not.toThrow();
+  });
+
+  it("keeps the bundle's own ports on loopback, which is what the carve-out rests on", () => {
+    // Allowing plain HTTP because every origin is a loopback URL is only sound
+    // while the bundle is actually reachable from loopback alone. A host port
+    // published as `4400:4400` listens on every interface, and the URL says
+    // nothing about the binding, so the premise lives in a different file from
+    // the rule. Pin it next to the rule that depends on it.
+    const compose = parseYaml(readFileSync(join(repoRoot, "docker-compose.yml"), "utf8")) as {
+      services: Record<string, { ports?: string[] }>;
+    };
+    const published = Object.entries(compose.services).flatMap(([service, definition]) =>
+      (definition.ports ?? []).map((port) => ({ service, port })),
+    );
+
+    // Not vacuous: the bundle does publish ports, and these are the ones.
+    expect(published.map(({ service }) => service)).toEqual(["api", "web"]);
+    expect(published.filter(({ port }) => !port.startsWith("127.0.0.1:"))).toEqual([]);
   });
 
   it("boots the single-host bundle on loopback origins", () => {

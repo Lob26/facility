@@ -51,9 +51,14 @@ curl --fail http://localhost:4400/readyz
 
 The preview origin is a separate security surface because it serves code an agent wrote. It stays a
 registered site of its own even here; `preview.localhost` resolves to loopback in modern browsers.
-A bundle whose origins are all loopback runs without TLS. Publishing any origin — a tunnel, a
-reverse proxy, a LAN address — puts the whole set back under the HTTPS requirement described in the
-[production guide](production.md).
+
+Both host ports are bound to `127.0.0.1`, so the bundle is reachable from the machine running it and
+nowhere else. That binding is what lets it run without TLS: a `localhost` URL constrains nothing on
+its own, and a port published on every interface would serve plaintext sessions and preview traffic
+to the network segment. Reaching the instance from another machine therefore means changing the
+binding, and changing it means putting TLS and the HTTPS requirements described in the
+[production guide](production.md) in front of it first. A tunnel or reverse proxy is the same
+decision.
 
 ## Connect GitHub
 
