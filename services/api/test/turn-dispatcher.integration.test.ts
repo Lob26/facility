@@ -113,6 +113,7 @@ environment:
     readonly name = "codex" as const;
     requests: AgentTurnRequest[] = [];
     outputOverride?: string;
+    renameNextBranch?: string;
     corruptResumeOnce = false;
     replacementPending = false;
     blockUntilCanceled = false;
@@ -153,6 +154,16 @@ environment:
         }
         throw error;
       }
+      if (this.renameNextBranch) {
+        const branch = this.renameNextBranch;
+        this.renameNextBranch = undefined;
+        const renamed = await runtime.exec(request.workspace, {
+          command: "git",
+          args: ["branch", "-m", branch],
+          cwd: request.cwd,
+        });
+        if (renamed.exitCode !== 0) throw new Error("branch rename failed");
+      }
       const secret = request.environment?.GH_TOKEN ?? "missing";
       const projectSecret = request.environment?.FACILITY_DISPATCH_SECRET ?? "missing";
       const nativeSessionId = this.replacementPending
@@ -162,8 +173,19 @@ environment:
       return {
         nativeSessionId,
         output: this.outputOverride ?? `completed with ${secret} and ${projectSecret}`,
+        progress: [],
         events: [
-          { engine: "codex", type: "item.completed", data: { output: secret, projectSecret } },
+          {
+            engine: "codex",
+            type: "item.completed",
+            data: {
+              output: secret,
+              projectSecret,
+              exitCode: 0,
+              ok: true,
+              configured: `0 true a"b`,
+            },
+          },
         ],
         exitCode: 0,
         stderr: "",
@@ -229,12 +251,17 @@ environment:
       storiesService,
       new AgentCatalogService(db, catalogSource),
       new GithubWorkspaceCredentialBroker(db, async () => ({
+        gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
         token: "secret-installation-token",
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       })),
       manifestSource,
-      new ProjectEnvironmentService(db, runtime, `file://${remotes}`, (_projectId, name) =>
-        name === "FACILITY_DISPATCH_SECRET" ? "project-secret" : undefined,
+      new ProjectEnvironmentService(
+        db,
+        runtime,
+        `file://${remotes}`,
+        (_projectId, name) => (name === "FACILITY_DISPATCH_SECRET" ? "project-secret" : undefined),
+        async () => ({ SHORT_VALUE: "0", FLAG_VALUE: "true", QUOTED_VALUE: 'a"b' }),
       ),
       new AgentEngineRegistry([engine]),
       new TurnGitEvidenceService(db, runtime),
@@ -321,6 +348,17 @@ environment:
       .orderBy(asc(turnEvents.seq));
     expect(JSON.stringify(events)).not.toContain("secret-installation-token");
     expect(JSON.stringify(events)).not.toContain("project-secret");
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          data: expect.objectContaining({
+            exitCode: 0,
+            ok: true,
+            configured: "[REDACTED] [REDACTED] [REDACTED]",
+          }),
+        }),
+      ]),
+    );
 
     const followUp = await storiesService.queueMessage({
       orgId,
@@ -614,7 +652,7 @@ environment:
     });
     expect(afterCancellation.turns.filter((turn) => turn.state === "canceled")).toHaveLength(1);
     expect(
-      afterCancellation.events.filter((event) => event.type === "turn.cancel_requested"),
+      (afterCancellation.events ?? []).filter((event) => event.type === "turn.cancel_requested"),
     ).toHaveLength(1);
 
     engine.blockUntilCanceled = false;
@@ -816,6 +854,55 @@ environment:
         (message) => message.body,
       ),
     ).toEqual(expect.arrayContaining(["Persist this message before the engine starts"]));
+  });
+
+  it("keeps the agent's renamed branch and native workspace on the next turn", async () => {
+    const branch = `chore/retained-${randomUUID()}`;
+    const started = await storiesService.start({
+      orgId,
+      projectId,
+      provider: "github",
+      externalId: `rename-${randomUUID()}`,
+      title: "Follow repository branch rules",
+      agent: builder,
+      message: "Rename the branch",
+      messageDedupeKey: randomUUID(),
+      actor: { type: "user", id: "test" },
+      workspace: { image: "facility-runner:test", ports: [] },
+    });
+    if (!started.queued.turn) throw new Error("missing turn");
+    engine.renameNextBranch = branch;
+    await expect(
+      dispatcher.dispatch({ orgId, projectId, turnId: started.queued.turn.id }),
+    ).resolves.toMatchObject({ state: "succeeded" });
+    expect((await storiesService.get(orgId, projectId, started.story.id)).story.branch).toBe(
+      branch,
+    );
+    const firstRequest = engine.requests.at(-1);
+    if (!firstRequest) throw new Error("missing request");
+    const next = await storiesService.queueMessage({
+      orgId,
+      projectId,
+      storyId: started.story.id,
+      body: "Continue on the same branch",
+      dedupeKey: randomUUID(),
+      agent: builder,
+      actor: { type: "user", id: "test" },
+      trigger: { type: "manual" },
+    });
+    if (!next.turn) throw new Error("missing next turn");
+    await expect(
+      dispatcher.dispatch({ orgId, projectId, turnId: next.turn.id }),
+    ).resolves.toMatchObject({ state: "succeeded" });
+    const request = engine.requests.at(-1);
+    expect(request?.workspace.id).toBe(firstRequest.workspace.id);
+    expect(request?.nativeSessionId).toBe("codex-native-session");
+    const actual = await runtime.exec(firstRequest.workspace, {
+      command: "git",
+      args: ["branch", "--show-current"],
+      cwd: firstRequest.cwd,
+    });
+    expect(actual.stdout.trim()).toBe(branch);
   });
 });
 
