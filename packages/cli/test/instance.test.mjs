@@ -52,6 +52,46 @@ async function captureJson(run) {
   }
 }
 
+// The bootstrap writes into whatever search_path it is handed, so each test
+// gets a schema of its own and drops it afterwards. Isolation is the point:
+// these assert the rows that were written, and a shared schema would make the
+// second test read the first one's binding.
+async function withBootstrapSchema(t, run) {
+  const databaseUrl = process.env.DATABASE_URL ?? "postgres://facility:facility@localhost:5461/facility_test";
+  const admin = postgres(databaseUrl, { max: 1, connect_timeout: 2 });
+  try { await admin`select 1`; } catch { await admin.end(); t.skip("Postgres unreachable"); return; }
+  const schema = `cli_bootstrap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await admin.unsafe(`CREATE SCHEMA "${schema}"`);
+  const scoped = new URL(databaseUrl);
+  scoped.searchParams.set("options", `-csearch_path=${schema}`);
+  try {
+    await admin.unsafe(`
+      CREATE TABLE "${schema}".roles (id text primary key, org_id text, name text);
+      CREATE TABLE "${schema}".orgs (id text primary key, name text, slug text unique, settings jsonb);
+      CREATE TABLE "${schema}".users (id text primary key, email text unique, name text, status text);
+      CREATE TABLE "${schema}".user_identities (id text primary key, user_id text, provider text, provider_subject text, login text, metadata jsonb);
+      CREATE TABLE "${schema}".org_members (id text primary key, org_id text, user_id text, role_id text);
+      CREATE TABLE "${schema}".github_installations (id text primary key, org_id text, installation_id bigint, account_id bigint, account_login text, target_type text);
+      INSERT INTO "${schema}".roles (id, org_id, name) VALUES ('role_bundled_owner', null, 'owner');
+    `);
+    await run({ admin, schema, databaseUrl: scoped.toString() });
+  } finally {
+    await admin.unsafe(`DROP SCHEMA "${schema}" CASCADE`);
+    await admin.end();
+  }
+}
+
+// Every row the bootstrap is responsible for, in one shape, so a test can
+// compare the whole binding before and after a refused attempt.
+async function storedBinding(admin, schema) {
+  const [org] = await admin.unsafe(`SELECT name, slug, settings FROM "${schema}".orgs`);
+  const [user] = await admin.unsafe(`SELECT email, name, status FROM "${schema}".users`);
+  const [identity] = await admin.unsafe(`SELECT provider, provider_subject, login FROM "${schema}".user_identities`);
+  const [member] = await admin.unsafe(`SELECT role_id FROM "${schema}".org_members`);
+  const [installation] = await admin.unsafe(`SELECT installation_id::int AS installation_id, account_id::int AS account_id, account_login, target_type FROM "${schema}".github_installations`);
+  return { org, user, identity, member, installation };
+}
+
 test("bootstrap validates all identity and installation bindings before connecting", async () => {
   assert.equal(await bootstrapInstance({ ...valid, "github-user-id": "not-a-number" }, { databaseUrl: "postgres://unused" }), 1);
 });
@@ -117,31 +157,96 @@ test("bootstrap names the environment variable for every value it is missing", a
 });
 
 test("bootstrap is transactional, idempotent for identical input, and rejects conflicts", async (t) => {
-  const databaseUrl = process.env.DATABASE_URL ?? "postgres://facility:facility@localhost:5461/facility_test";
-  const admin = postgres(databaseUrl, { max: 1, connect_timeout: 2 });
-  try { await admin`select 1`; } catch { await admin.end(); t.skip("Postgres unreachable"); return; }
-  const schema = `cli_bootstrap_${Date.now()}`;
-  await admin.unsafe(`CREATE SCHEMA "${schema}"`);
-  try {
-    await admin.unsafe(`
-      CREATE TABLE "${schema}".roles (id text primary key, org_id text, name text);
-      CREATE TABLE "${schema}".orgs (id text primary key, name text, slug text unique, settings jsonb);
-      CREATE TABLE "${schema}".users (id text primary key, email text unique, name text, status text);
-      CREATE TABLE "${schema}".user_identities (id text primary key, user_id text, provider text, provider_subject text, login text, metadata jsonb);
-      CREATE TABLE "${schema}".org_members (id text primary key, org_id text, user_id text, role_id text);
-      CREATE TABLE "${schema}".github_installations (id text primary key, org_id text, installation_id bigint, account_id bigint, account_login text, target_type text);
-      INSERT INTO "${schema}".roles (id, org_id, name) VALUES ('role_bundled_owner', null, 'owner');
-    `);
-    const scoped = new URL(databaseUrl);
-    scoped.searchParams.set("options", `-csearch_path=${schema}`);
-    assert.equal(await bootstrapInstance(valid, { databaseUrl: scoped.toString() }), 0);
-    assert.equal(await bootstrapInstance(valid, { databaseUrl: scoped.toString() }), 0);
-    assert.equal(await bootstrapInstance({ ...valid, "github-user-id": "124" }, { databaseUrl: scoped.toString() }), 1);
-    assert.equal(await bootstrapInstance({ ...valid, "owner-name": "Different owner" }, { databaseUrl: scoped.toString() }), 1);
+  await withBootstrapSchema(t, async ({ admin, schema, databaseUrl }) => {
+    assert.equal(await bootstrapInstance(valid, { databaseUrl }), 0);
+    assert.equal(await bootstrapInstance(valid, { databaseUrl }), 0);
+    assert.equal(await bootstrapInstance({ ...valid, "github-user-id": "124" }, { databaseUrl }), 1);
+    assert.equal(await bootstrapInstance({ ...valid, "owner-name": "Different owner" }, { databaseUrl }), 1);
     const rows = await admin.unsafe(`SELECT count(*)::int AS count FROM "${schema}".orgs`);
     assert.equal(rows[0].count, 1);
-  } finally {
-    await admin.unsafe(`DROP SCHEMA "${schema}" CASCADE`);
-    await admin.end();
-  }
+  });
+});
+
+test("bootstrap from the environment writes the same binding the options write", async (t) => {
+  await withBootstrapSchema(t, async ({ admin, schema, databaseUrl }) => {
+    // No option carries a value: this is how the Compose bootstrap profile
+    // invokes it, and the point of the PR is that this path reaches the rows.
+    assert.equal(await bootstrapInstance({ json: true }, { databaseUrl, environment }), 0);
+
+    const stored = await storedBinding(admin, schema);
+    assert.deepEqual(stored.org, {
+      name: "Facility Test",
+      slug: "facility-test",
+      settings: { githubAccountId: 456, githubInstallationId: 789 },
+    });
+    // FACILITY_OWNER_EMAIL is "Owner@Example.com": normalized on the way in,
+    // exactly as the option path normalizes it.
+    assert.deepEqual(stored.user, { email: "owner@example.com", name: "Owner", status: "active" });
+    assert.deepEqual(stored.identity, { provider: "github", provider_subject: "123", login: "owner" });
+    assert.equal(stored.member.role_id, "role_bundled_owner");
+    assert.deepEqual(stored.installation, {
+      installation_id: 789,
+      account_id: 456,
+      account_login: "facility-test",
+      target_type: "Organization",
+    });
+
+    // Re-running a container task must not be a second organization.
+    assert.equal(await bootstrapInstance({ json: true }, { databaseUrl, environment }), 0);
+    const [{ count }] = await admin.unsafe(`SELECT count(*)::int AS count FROM "${schema}".orgs`);
+    assert.equal(count, 1);
+    assert.deepEqual(await storedBinding(admin, schema), stored);
+  });
+});
+
+test("an option beats its variable in the row that is written, not only in validation", async (t) => {
+  await withBootstrapSchema(t, async ({ admin, schema, databaseUrl }) => {
+    assert.equal(
+      await bootstrapInstance(
+        { json: true, "org-slug": "from-option", "github-installation-id": "999" },
+        {
+          databaseUrl,
+          environment: {
+            ...environment,
+            FACILITY_ORG_SLUG: "from-environment",
+            FACILITY_GITHUB_INSTALLATION_ID: "789",
+          },
+        },
+      ),
+      0,
+    );
+
+    const stored = await storedBinding(admin, schema);
+    assert.equal(stored.org.slug, "from-option");
+    // Precedence has to hold everywhere the value lands, not just in the column
+    // the flag is named after: the installation id is also copied into settings.
+    assert.equal(stored.org.settings.githubInstallationId, 999);
+    assert.equal(stored.installation.installation_id, 999);
+  });
+});
+
+test("a conflicting binding from the environment is refused and leaves every row untouched", async (t) => {
+  await withBootstrapSchema(t, async ({ admin, schema, databaseUrl }) => {
+    assert.equal(await bootstrapInstance({ json: true }, { databaseUrl, environment }), 0);
+    const before = await storedBinding(admin, schema);
+
+    // One conflict per dimension the binding is made of: identity, person, and
+    // installation. Each must be refused rather than merged into the existing
+    // instance, and the refusal must not be a partial write.
+    for (const conflict of [
+      { FACILITY_GITHUB_USER_ID: "124" },
+      { FACILITY_OWNER_NAME: "Different owner" },
+      { FACILITY_GITHUB_INSTALLATION_ID: "790" },
+      { FACILITY_ORG_SLUG: "other-instance" },
+    ]) {
+      assert.equal(
+        await bootstrapInstance({ json: true }, { databaseUrl, environment: { ...environment, ...conflict } }),
+        1,
+      );
+    }
+
+    assert.deepEqual(await storedBinding(admin, schema), before);
+    const [{ count }] = await admin.unsafe(`SELECT count(*)::int AS count FROM "${schema}".orgs`);
+    assert.equal(count, 1);
+  });
 });
