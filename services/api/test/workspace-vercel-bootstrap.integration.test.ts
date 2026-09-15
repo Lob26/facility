@@ -16,6 +16,7 @@ vi.mock("@vercel/sandbox", async (original) => ({
 import { VercelWorkspaceRuntime } from "../src/workspaces/vercel.js";
 
 const cleanups: (() => Promise<void>)[] = [];
+const bootId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
@@ -23,11 +24,15 @@ afterEach(async () => {
 async function localProvider(
   brokenGateway: boolean,
   dockerState: "ready" | "stale-pid" | "starting" = "ready",
+  kernelBootId: string | null = bootId,
 ) {
   const root = await mkdtemp(join(tmpdir(), "facility-vercel-bootstrap-"));
   const bin = join(root, "bin");
   await mkdir(bin);
   await mkdir(join(root, "run"));
+  await mkdir(join(root, "proc/sys/kernel/random"), { recursive: true });
+  if (kernelBootId !== null)
+    await writeFile(join(root, "proc/sys/kernel/random/boot_id"), `${kernelBootId}\n`);
   // Own the colliding PID, so even a regression that signals it cannot touch
   // an unrelated host process. /proc itself remains a deterministic fake.
   const colliding = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -39,6 +44,7 @@ async function localProvider(
     colliding.kill();
   });
   await mkdir(join(root, "proc", String(dockerPid)), { recursive: true });
+  await writeFile(join(root, "proc", String(dockerPid), "environ"), "OTHER=fixture\0");
   if (dockerState !== "ready") {
     await writeFile(join(root, "run/docker.pid"), String(dockerPid));
     await writeFile(join(root, "run/docker.sock"), "existing socket");
@@ -74,7 +80,21 @@ async function localProvider(
         : dockerState === "stale-pid"
           ? `test -f '${root}/docker-ready'`
           : `if test -f '${root}/docker-waited'; then exit 0; fi; touch '${root}/docker-waited'; exit 1`,
-    dockerd: `test ! -d '${root}/run/docker/containerd' || exit 8\ntest ! -f '${root}/run/docker.pid' || { echo 'stale daemon PID' >&2; exit 1; }\necho started > '${root}/docker-started'\ntouch '${root}/docker-ready'`,
+    dockerd: `test ! -d '${root}/run/docker/containerd' || exit 8
+test ! -f '${root}/run/docker.pid' || { echo 'stale daemon PID' >&2; exit 1; }
+exec_root='${root}/run/docker'
+for arg in "$@"; do
+  case "$arg" in --exec-root=*) exec_root="\${arg#--exec-root=}" ;; esac
+done
+if test -e "$exec_root/runtime-runc/moby/retained"; then
+  echo 'container with given ID already exists' >&2
+  exit 1
+fi
+mkdir -p "$exec_root/runtime-runc/moby"
+echo 'transient container state' > "$exec_root/runtime-runc/moby/retained"
+echo "$exec_root" >> '${root}/docker-exec-roots'
+echo started > '${root}/docker-started'
+touch '${root}/docker-ready'`,
     // Model the ownership boundary: recursively reassigning a persisted Docker
     // tree would corrupt container UIDs, even when daemon startup succeeds.
     chown: 'test "$1" != -R || { echo "recursive ownership reset" >&2; exit 1; }',
@@ -204,8 +224,64 @@ it("starts Docker after a restored PID collides with an unrelated process, prese
   expect(fixture.stop).not.toHaveBeenCalled();
 });
 
+it("restores containers with fresh execution state on each boot, preserving old state and data", async () => {
+  const { fixture, root } = await localProvider(false, "stale-pid");
+  const priorRoot = join(root, "run/docker/runtime-runc/moby");
+  const volume = join(root, ".facility/docker/volumes/database");
+  await mkdir(priorRoot, { recursive: true });
+  await writeFile(join(priorRoot, "retained"), "snapshot process state");
+  await mkdir(volume, { recursive: true });
+  await writeFile(join(volume, "retained"), "seeded database");
+  const runtime = new VercelWorkspaceRuntime();
+  const input = { id: fixture.name, image: "runner:test" };
+  await runtime.create(input);
+  // A second acquire in this boot must keep the already-running daemon.
+  await runtime.create(input);
+  const firstRoot = join(root, `run/facility-docker-${bootId}`);
+  expect(await readFile(join(root, "docker-exec-roots"), "utf8")).toBe(`${firstRoot}\n`);
+
+  // Model a snapshot restore: all disk files survive, but readiness and boot ID change.
+  const nextBootId = "11111111-2222-4333-8444-555555555555";
+  await rm(join(root, "docker-ready"));
+  await writeFile(join(root, "proc/sys/kernel/random/boot_id"), `${nextBootId}\n`);
+  await runtime.create(input);
+  expect(await readFile(join(root, "docker-exec-roots"), "utf8")).toBe(
+    `${firstRoot}\n${join(root, `run/facility-docker-${nextBootId}`)}\n`,
+  );
+  expect(await readFile(join(priorRoot, "retained"), "utf8")).toBe("snapshot process state");
+  expect(await readFile(join(firstRoot, "runtime-runc/moby/retained"), "utf8")).toBe(
+    "transient container state\n",
+  );
+  expect(await readFile(join(volume, "retained"), "utf8")).toBe("seeded database");
+  expect(fixture.stop).not.toHaveBeenCalled();
+});
+
+it.each([
+  null,
+  "",
+  "../../workspace",
+  "a".repeat(36),
+  `${bootId}\nanother-line`,
+])("refuses Docker startup with missing or malformed kernel boot ID %s", async (kernelBootId) => {
+  const { fixture, root, dockerPid, colliding } = await localProvider(
+    false,
+    "stale-pid",
+    kernelBootId,
+  );
+  await expect(
+    new VercelWorkspaceRuntime().create({ id: fixture.name, image: "runner:test" }),
+  ).rejects.toMatchObject({ code: "workspace_initialize_failed" });
+  expect(await readFile(join(root, "run/docker.pid"), "utf8")).toBe(String(dockerPid));
+  expect(await readFile(join(root, "run/docker.sock"), "utf8")).toBe("existing socket");
+  await expect(readFile(join(root, "docker-started"), "utf8")).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  expect(colliding.signalCode).toBeNull();
+  expect(fixture.stop).toHaveBeenCalledOnce();
+});
+
 it("waits for an existing Docker daemon without removing its PID or launching another", async () => {
-  const { fixture, appPort, root, dockerPid } = await localProvider(false, "starting");
+  const { fixture, appPort, root, dockerPid } = await localProvider(false, "starting", null);
   await new VercelWorkspaceRuntime().create({
     id: fixture.name,
     image: "runner:test",
@@ -280,4 +356,59 @@ it("replaces only the recorded gateway invocation for this port", async () => {
     environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "x".repeat(32) },
   });
   expect(colliding.signalCode).toBe("SIGTERM");
+});
+
+it.each([
+  false,
+  true,
+])("reuses a healthy gateway only with the same credential (rotate=%s)", async (rotate) => {
+  const { fixture, appPort, root, gatewayPort } = await localProvider(false);
+  const runtime = new VercelWorkspaceRuntime();
+  const originalToken = "original-preview-credential-".repeat(2);
+  const input = {
+    id: fixture.name,
+    image: "runner:test",
+    ports: [{ service: "web", port: appPort }],
+    environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: originalToken },
+  };
+  await runtime.create(input);
+  const pidPath = join(root, `.facility/preview-${gatewayPort}.pid`);
+  const before = (await readFile(pidPath, "utf8")).trim();
+  // Linux /proc is a deterministic fixture on both macOS and Linux CI.
+  await mkdir(join(root, "proc", before), { recursive: true });
+  await writeFile(
+    join(root, "proc", before, "cmdline"),
+    [
+      "node",
+      "/usr/local/bin/facility-preview-gateway",
+      "--listen",
+      String(gatewayPort),
+      "--target",
+      String(appPort),
+      "",
+    ].join("\0"),
+  );
+  await writeFile(
+    join(root, "proc", before, "environ"),
+    `FACILITY_PREVIEW_GATEWAY_TOKEN=${originalToken}\0`,
+  );
+  const token = rotate ? "rotated-preview-credential-".repeat(2) : originalToken;
+  await runtime.create({ ...input, environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: token } });
+  const after = (await readFile(pidPath, "utf8")).trim();
+  if (rotate) expect(after).not.toBe(before);
+  else expect(after).toBe(before);
+  const url = `http://127.0.0.1:${gatewayPort}/`;
+  expect((await fetch(url)).status).toBe(401);
+  expect(
+    (await fetch(url, { headers: { "x-facility-preview-token": "another-workspace-credential" } }))
+      .status,
+  ).toBe(401);
+  const allowed = await fetch(url, { headers: { "x-facility-preview-token": token } });
+  expect(allowed.status).toBe(200);
+  expect(await allowed.text()).toBe("preview app");
+  if (rotate)
+    expect(
+      (await fetch(url, { headers: { "x-facility-preview-token": originalToken } })).status,
+    ).toBe(401);
+  expect(fixture.stop).not.toHaveBeenCalled();
 });
