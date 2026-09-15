@@ -98,8 +98,10 @@ the API from the deployment secret store.
 ## Authorization behavior
 
 Human authorization is organization-wide. A role grants its permissions across every project in the
-organization, so any active member holding `workspaces:execute` can read and continue any story in
-it. There is no project membership and no project dimension on a role: "maintainer on one
+organization, and reading and acting are separate grants: `projects:read` is what reads a story and
+its conversation, while `workspaces:execute` is what continues one, opens its preview, or suspends
+it. `workspaces:execute` does not imply read access, so a role needs both to follow a story and act
+on it. There is no project membership and no project dimension on either: "maintainer on one
 repository" cannot be expressed.
 
 The project dimension exists for API keys. A project-scoped key is pinned to one project, and a
