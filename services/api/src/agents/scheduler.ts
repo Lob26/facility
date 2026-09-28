@@ -2,7 +2,10 @@ import { agentSchedules, type FacilityDb, projects, turns } from "@facility/db";
 import cronParser from "cron-parser";
 import { and, desc, eq, isNull, lte, sql } from "drizzle-orm";
 import type { StoryWorkspaceService } from "../stories/service.js";
-import type { ProjectManifest, ProjectManifestSource } from "../workspaces/project-environment.js";
+import {
+  type ProjectManifestSource,
+  projectWorkspaceInput,
+} from "../workspaces/project-environment.js";
 import { type AgentCatalogService, manifestFromProjection } from "./catalog.js";
 
 export class AgentScheduler {
@@ -60,7 +63,7 @@ export class AgentScheduler {
           message: `Run scheduled agent ${schedule.agentName} (${schedule.triggerName}) for ${schedule.nextRunAt.toISOString()}.`,
           messageDedupeKey: `schedule:${schedule.agentName}:${schedule.triggerName}:${schedule.nextRunAt.toISOString()}`,
           actor: { type: "system", id: `schedule:${schedule.triggerName}` },
-          workspace: workspaceInput(projectManifest, this.defaultImage),
+          workspace: projectWorkspaceInput(projectManifest, this.defaultImage),
           trigger: {
             type: "schedule",
             key: `schedule:${schedule.triggerName}`,
@@ -225,7 +228,6 @@ export class AgentScheduler {
 export function nextOccurrence(cron: string, timezone: string, from: Date) {
   return cronParser.parseExpression(cron, { currentDate: from, tz: timezone }).next().toDate();
 }
-
 /**
  * Where a due schedule should point once its occurrence is claimed.
  *
@@ -248,17 +250,5 @@ export function scheduleAdvance(cron: string, timezone: string, dueAt: Date, now
     // following occurrence had already come due as well. One extra cron step,
     // never a walk over the backlog, so an outage of any length costs the same.
     missed: nextOccurrence(cron, timezone, dueAt) <= now,
-  };
-}
-
-function workspaceInput(manifest: ProjectManifest, defaultImage: string) {
-  return {
-    image: manifest.environment.image ?? defaultImage,
-    ports: Object.entries(manifest.environment.services).map(([service, value]) => ({
-      service,
-      port: value.port,
-      protocol: value.protocol,
-      websocket: value.websocket,
-    })),
   };
 }

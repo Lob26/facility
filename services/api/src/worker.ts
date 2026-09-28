@@ -1,5 +1,5 @@
 import { createDb, type FacilityDb, turns } from "@facility/db";
-import { and, asc, eq, lte } from "drizzle-orm";
+import { and, asc, eq, isNull, lte, or } from "drizzle-orm";
 import PgBoss from "pg-boss";
 import pino from "pino";
 import { readConfig } from "./config.js";
@@ -9,12 +9,15 @@ import { StoryIntegrationNotifications } from "./stories/integration-notificatio
 import type { StoryWorkspaceService } from "./stories/service.js";
 import type { StoryTitleService } from "./stories/titles.js";
 import { createStoryDomain } from "./story-domain.js";
+import { configureTurnQueue } from "./turn-queue.js";
+import { ecsTaskProtection, WorkerTurnGuard } from "./worker-task-protection.js";
 
 const TURN_LEASE_TIMEOUT_MS = 2 * 60 * 1_000;
 
 export async function startWorker() {
   const config = readConfig();
   const logger = pino({ level: config.logLevel });
+  const turnGuard = new WorkerTurnGuard(await ecsTaskProtection(process.env), logger);
   const { db, client } = createDb(config.databaseUrl);
   const boss = new PgBoss({ connectionString: config.databaseUrl });
   boss.on("error", (error) => logger.error({ err: error }, "pg-boss error"));
@@ -40,6 +43,7 @@ export async function startWorker() {
   for (const queue of queues) {
     await boss.createQueue(queue);
   }
+  await configureTurnQueue(boss);
   // A provider hiccup retries a few times; the story keeps its provisional title meanwhile.
   await boss.updateQueue("stories.title", {
     name: "stories.title",
@@ -76,9 +80,30 @@ export async function startWorker() {
       const data = job?.data;
       let result: Record<string, unknown> | undefined;
       if (queue === "turns.dispatch") {
-        result = await storyDomain.dispatcher.dispatch(
-          data as { orgId: string; projectId: string; turnId: string },
+        const dispatched = await turnGuard.run(() =>
+          storyDomain.dispatcher
+            .dispatch(data as { orgId: string; projectId: string; turnId: string })
+            .catch((error: unknown) => {
+              logger.error(
+                {
+                  event: "worker.turn_dispatch_failed",
+                  turnId: (data as { turnId: string }).turnId,
+                  jobId,
+                },
+                "turn dispatch escaped terminal handling; lease recovery will reconcile it",
+              );
+              throw error;
+            }),
         );
+        // Agent output belongs in scoped, redacted turn events, not infrastructure logs.
+        result = {
+          claimed: dispatched.claimed,
+          ...("state" in dispatched ? { state: dispatched.state } : {}),
+          ...("retryAfter" in dispatched ? { retryAfter: dispatched.retryAfter } : {}),
+          orgId: (data as { orgId: string }).orgId,
+          projectId: (data as { projectId: string }).projectId,
+          turnId: (data as { turnId: string }).turnId,
+        };
       } else if (queue === "github.mirror") {
         result = await storyDomain.mirror.syncAll();
       } else if (queue === "stories.integrations" && githubFactory) {
@@ -87,6 +112,7 @@ export async function startWorker() {
           storyDomain.backlog,
           config.previewSites ?? [],
           githubFactory,
+          config.nativePreviews,
         ).tick();
         if (result.failed)
           logger.warn(
@@ -112,6 +138,7 @@ export async function startWorker() {
         const recoveredTurns = await recoverQueuedTurns(db, (name, payload) =>
           boss.send(name, payload),
         );
+        const suspendedWorkspaces = await storyDomain.stories.suspendFailedWorkspaces();
         const pendingTitles = await recoverPendingTitles(storyDomain.titles, (name, payload) =>
           boss.send(name, payload),
         );
@@ -119,6 +146,7 @@ export async function startWorker() {
           ...(await storyDomain.scheduler.tick()),
           interruptedTurns,
           recoveredTurns,
+          suspendedWorkspaces,
           pendingTitles,
         };
       }
@@ -130,7 +158,12 @@ export async function startWorker() {
   await boss.schedule("stories.integrations", "* * * * *", {});
   logger.info({ queues }, "facility worker started");
   boss.on("stopped", () => void client.end());
-  return boss;
+  return {
+    stop: () => {
+      turnGuard.close();
+      return boss.stop({ graceful: true, timeout: 30_000, close: true });
+    },
+  };
 }
 
 /** Titles whose job was lost (restart, crash) are queued again; generation itself stays idempotent. */
@@ -153,7 +186,12 @@ export async function recoverQueuedTurns(
   const queued = await db
     .select({ id: turns.id, orgId: turns.orgId, projectId: turns.projectId })
     .from(turns)
-    .where(eq(turns.state, "queued"))
+    .where(
+      and(
+        eq(turns.state, "queued"),
+        or(isNull(turns.retryAfter), lte(turns.retryAfter, new Date())),
+      ),
+    )
     .orderBy(asc(turns.createdAt))
     .limit(limit);
   for (const turn of queued) {
@@ -221,7 +259,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       closing = true;
       console.info(`facility worker received ${signal}; finishing active jobs`);
       try {
-        await boss.stop({ graceful: true, timeout: 30_000, close: true });
+        await boss.stop();
       } catch (error) {
         console.error("facility worker shutdown failed", error);
         process.exitCode = 1;
