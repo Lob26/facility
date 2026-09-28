@@ -79,6 +79,17 @@ function describe(
     };
   }
   switch (type) {
+    case "turn.phase":
+      return { kind: "lifecycle", title: "Run phase", text: text(data.phase) };
+    case "workspace.health":
+      return {
+        kind: data.probe === "unavailable" ? "error" : "lifecycle",
+        title:
+          data.probe === "unavailable"
+            ? "Workspace health probe unavailable"
+            : "Workspace health recorded",
+        text: JSON.stringify(data),
+      };
     case "turn.started":
       return { kind: "lifecycle", title: "Run started", text: null };
     case "turn.succeeded":
@@ -122,6 +133,19 @@ function describeEngineEvent(
   type: string,
   data: Record<string, unknown>,
 ): { kind: ActivityKind; title: string; text: string | null } {
+  if (type === "observation") {
+    const recovered = data.state === "recovered";
+    const failed = data.state === "failed";
+    return {
+      kind: failed ? "error" : "lifecycle",
+      title: recovered
+        ? "Command observation recovered"
+        : failed
+          ? "Command observation failed"
+          : "Recovering command observation",
+      text: `Operation: ${text(data.operation) ?? "unknown"}. ${recovered ? "Output collection resumed." : failed ? "The provider read could not continue." : "Reconnecting to the existing command; it has not been resubmitted."}`,
+    };
+  }
   // Claude Code stream-json
   if (type === "system") {
     const model = text(data.model);
