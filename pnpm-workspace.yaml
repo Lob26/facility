@@ -6,6 +6,22 @@ packages:
 
 # Workspace-wide security floors for transitive dependencies.
 overrides:
+  "proxy-addr@>=1.1.0 <2.0.8": 2.0.8
+  # Tinypool 2 drops Node 18; Facility already requires Node 22.13+/24.
+  # Exercise both worker pollution vectors and the real docs build in tests.
+  "tinypool@<2.1.2": 2.1.2
+  "source-map-js@>=1.0.0 <1.2.2": 1.2.2
+  "compression@<1.8.2": 1.8.2
+  "postcss-selector-parser@<7.1.6": 7.1.6
+  "prosemirror-view@<1.42.3": 1.42.3
+  # Keep Vue's renderer/compiler/runtime on its coordinated patch release.
+  "vue@>=3.0.0 <3.5.42": 3.5.42
+  "katex@>=0.11.0 <0.18.2": 0.18.2
+  # Argparse 2 retains the legacy CLI API and removes sprintf-js entirely.
+  # Scope the major override to js-yaml 3; exercise its CLI in regression tests.
+  # The CLI-only patch below preserves the legacy --version output.
+  "js-yaml@3>argparse": 2.0.1
+  "http-cache-semantics@<4.3.0": 4.3.0
   "browserslist@<4.28.7": 4.28.7
   "esbuild@>=0.27.3 <0.28.1": 0.28.1
   "postcss@<8.5.23": 8.5.23
@@ -13,11 +29,12 @@ overrides:
   # resolves a vulnerable v6 without this floor.
   "serialize-javascript@<=7.0.2": 7.0.7
   "uuid@<11.1.1": 11.1.1
-  "brace-expansion@<1.1.18": 1.1.18
-  "brace-expansion@>=2.0.0 <2.1.4": 2.1.4
-  "brace-expansion@>=5.0.0 <5.0.9": 5.0.9
+  "brace-expansion@<1.1.21": 1.1.21
+  "brace-expansion@>=2.0.0 <2.1.7": 2.1.7
+  "brace-expansion@>=4.0.0 <5.0.12": 5.0.12
   "@fastify/static@<10.1.2": 10.1.2
-  "fast-uri@>=3.0.0 <3.1.6": 3.1.6
+  "fast-uri@>=3.0.0 <3.1.8": 3.1.8
+  "fast-uri@>=4.0.0 <4.1.5": 4.1.5
   "qs@<6.16.0": 6.16.0
   "find-my-way@<9.6.1": 9.7.0
   "js-yaml@>=3.0.0 <3.15.2": 3.15.2
@@ -26,14 +43,16 @@ overrides:
   "svgo@>=3.0.0 <3.3.5": 3.3.5
   "body-parser@<1.20.6": 1.20.6
   "@hono/node-server@<2.0.10": 2.0.10
-  "hono@<4.13.5": 4.13.5
-  "ip-address@<10.3.1": 10.3.1
+  "hono@<4.13.7": 4.13.7
+  "ip-address@<10.7.1": 10.7.1
+  "@grpc/grpc-js@>=1.14.0 <1.14.5": 1.14.5
+  "undici@>=7.28.0 <7.29.1": 7.29.1
   "protobufjs@>=7.5.0 <7.6.5": 7.6.5
   "webpack-dev-server@<=5.2.5": 5.2.6
-  "dompurify@<=3.4.12": 3.4.13
+  "dompurify@<3.4.16": 3.4.16
   "nanoid@>=3.0.0 <3.3.18": 3.3.18
   "colord@<2.9.4": 2.9.4
-  "joi@>=16.0.0 <17.13.6": 17.13.6
+  "joi@>=16.0.0 <17.13.8": 17.13.8
   "baseline-browser-mapping@>=2.0.0 <2.11.0": 2.11.0
 
 # Postinstall build-script allowlist — nothing builds unless named here.
@@ -50,7 +69,7 @@ allowBuilds:
   ssh2: false
 
 # The advisory database still flags brace-expansion 1.x/2.x for GHSA-mh99-v99m-4gvg,
-# although 1.1.18 and 2.1.4 contain the bounded-expansion backport. Keep this temporary
+# although the patched legacy versions above contain the bounded-expansion backport. Keep this temporary
 # ignore only while those patched legacy lines are required by the current dependency graph.
 # image-size has no upstream fixed release for its zero-length ICNS/HEIF/JXL loops.
 # The local patch adds progress guards, covered by dependencies-security.test.mjs.
@@ -59,12 +78,17 @@ auditConfig:
     - GHSA-mh99-v99m-4gvg
     - GHSA-w3rx-r6r6-pgpr
     - GHSA-5p2g-fcmc-qvqq
+    # Temporary accepted risk: docs tooling uses braces 3.0.3; no official fix.
+    # Owner: @alvaroloes; human review by 2026-10-13 (not an automatic expiry).
+    # Remove after an official fix/advisory resolution: https://github.com/theam/facility/issues/450
+    - GHSA-vfj7-8cjw-p6xm
 
 minimumReleaseAgeExclude:
   - '@vercel/sandbox@3.0.0'
 
 patchedDependencies:
   image-size@2.0.2: patches/image-size@2.0.2.patch
+  js-yaml@3.15.2: patches/js-yaml@3.15.2.patch
 
 # Filtered production-image installs intentionally omit the docs-only patched
 # dependency. Keep full repository installs strict and open this exception only
