@@ -19,7 +19,7 @@ nested Docker images, and persistent volumes.
 ## Start the local stack
 
 ```bash
-npm install --global pnpm@11.20.0
+npm install --global pnpm@11.28.2
 pnpm install --frozen-lockfile
 cp .env.example .env
 docker build -f runner/Dockerfile -t facility-runner:dev .

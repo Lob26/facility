@@ -9,10 +9,10 @@ This guide covers work on the Facility monorepo. If you only want to run the pro
 
 ## Toolchain
 
-Install Node.js 24 LTS and pnpm 11.20.0 before running the repository:
+Install Node.js 24 LTS and pnpm 11.28.2 before running the repository:
 
 ```bash
-npm install --global pnpm@11.20.0
+npm install --global pnpm@11.28.2
 ```
 
 The root `package.json` also accepts Node.js 22 from 22.13.0. Node.js 25 and later are outside that
